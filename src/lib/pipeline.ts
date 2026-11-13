@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { ChildProcess } from "node:child_process";
 import { db } from "@/lib/db";
+import { getStyle } from "@/lib/styles";
 import { buildAss, composeShort, extractFrame, probe, pythonHasModule, run, transcribe, PYTHON, type Cue } from "@/lib/media";
 
 export const DATA_DIR = path.join(process.cwd(), "data");
@@ -192,7 +193,7 @@ async function generateScript(id: number) {
   const prompt = `너는 유튜브 쇼츠 나레이션 작가다. 아래 이미지 파일들은 원본 영상에서 시간 순서로 균등하게 뽑은 프레임 ${frames.length}장이다 (원본 길이 ${dur.toFixed(1)}초). 첨부돼 있지 않다면 Read 도구로 모두 열어서 보고 판단해라.
 ${frames.map((f, i) => `- 프레임 ${i + 1}: ${f}`).join("\n")}
 프로젝트 제목: ${p.title}
-스타일: ${p.style || "기본(정보 전달 + 흥미 유발)"}
+스타일: ${p.style ? getStyle(p.style).label : "기본(정보 전달 + 흥미 유발)"}
 출력 언어: ${LANG_NAME[lang] ?? lang}
 목표 쇼츠 길이: ${target}초 이내
 ${transcript ? `원본 음성 전사:\n"""${transcript.slice(0, 6000)}"""\n` : "원본 음성 전사: 없음 (프레임만 보고 판단)\n"}
@@ -224,7 +225,7 @@ ${transcript ? `원본 음성 전사:\n"""${transcript.slice(0, 6000)}"""\n` : "
 
 const VOICES: Record<string, string> = {
   ko: "ko-KR-SunHiNeural",
-  en: "en-US-JennyNeural",
+  en: "en-US-AriaNeural",
   ja: "ja-JP-NanamiNeural",
   zh: "zh-CN-XiaoxiaoNeural",
   es: "es-ES-ElviraNeural",
@@ -249,40 +250,54 @@ async function renderProject(id: number) {
   fs.mkdirSync(path.join(dir, "fonts"), { recursive: true });
   if (fs.existsSync(FONT_FILE)) fs.copyFileSync(FONT_FILE, path.join(dir, "fonts", "malgun.ttf"));
 
+  const style = getStyle(p.style);
   const GAP = 0.25;
   const maxDur = p.duration_sec || 58;
   const lang = p.language || "ko";
   let narration: string | null = null;
   let warning: string | null = null;
-  const segs: { dur: number; text: string }[] = [];
+  let segs: { dur: number; text: string }[] = [];
+  let gap = GAP;
+  const limit = maxDur - 0.3;
 
   if (hasTts) {
-    // 1) 문장별 TTS
+    // 1) 문장별 TTS → 앞뒤 무음 제거한 wav
     const voice = VOICES[lang] ?? VOICES.ko;
-    const files: string[] = [];
+    const raw: { file: string; dur: number; text: string }[] = [];
+    const trim = "silenceremove=start_periods=1:start_threshold=-50dB,areverse,silenceremove=start_periods=1:start_threshold=-50dB,areverse";
     for (let i = 0; i < script.narration.length; i++) {
       const text = script.narration[i].text;
       const txt = path.join(dir, `n${i}.txt`);
       const mp3 = path.join(dir, `n${i}.mp3`);
+      const wav = path.join(dir, `n${i}.wav`);
       fs.writeFileSync(txt, text, "utf8");
       await run(PYTHON, ["-m", "edge_tts", "--voice", voice, "--rate", "+10%", "-f", txt, "--write-media", mp3], {
         onSpawn,
         timeoutMs: 120_000,
       });
+      await run("ffmpeg", ["-y", "-v", "error", "-i", mp3, "-af", `${trim},aresample=44100`, "-ac", "2", wav], { onSpawn });
       ensureActive(id, "rendering");
-      files.push(mp3);
-      segs.push({ dur: (await probe(mp3)).duration, text });
+      raw.push({ file: wav, dur: (await probe(wav)).duration, text });
     }
-    // 2) 나레이션 이어붙이기 (문장 사이 GAP)
-    const inputs = files.flatMap((f) => ["-i", f]);
+    // 2) 길이 맞추기: 넘치면 최대 1.3배속, 그래도 넘치면 뒤 문장부터 제외
+    const MAX_TEMPO = 1.3;
+    const sum = (arr: typeof raw) => arr.reduce((a, s) => a + s.dur + GAP, 0) - GAP;
+    let kept = raw.slice();
+    while (kept.length > 1 && sum(kept) / MAX_TEMPO > limit) kept = kept.slice(0, -1);
+    const tempo = Math.min(MAX_TEMPO, Math.max(1, sum(kept) / limit));
+    if (kept.length < raw.length) warning = `나레이션이 ${maxDur}초를 넘어 마지막 ${raw.length - kept.length}문장 제외됨`;
+    // 3) 이어붙이기 (문장 사이 GAP) + 배속
+    const inputs = kept.flatMap((s) => ["-i", s.file]);
     const filt =
-      files.map((_, i) => `[${i}:a]aresample=44100,aformat=channel_layouts=stereo,apad=pad_dur=${GAP}[s${i}]`).join(";") +
+      kept.map((_, i) => `[${i}:a]aformat=sample_rates=44100:channel_layouts=stereo${i < kept.length - 1 ? `,apad=pad_dur=${GAP}` : ""}[s${i}]`).join(";") +
       ";" +
-      files.map((_, i) => `[s${i}]`).join("") +
-      `concat=n=${files.length}:v=0:a=1[out]`;
+      kept.map((_, i) => `[s${i}]`).join("") +
+      `concat=n=${kept.length}:v=0:a=1${tempo > 1.001 ? `,atempo=${tempo.toFixed(4)}` : ""}[out]`;
     narration = path.join(dir, "narration.wav");
     await run("ffmpeg", ["-y", "-v", "error", ...inputs, "-filter_complex", filt, "-map", "[out]", narration], { onSpawn });
     ensureActive(id, "rendering");
+    segs = kept.map((s) => ({ dur: s.dur / tempo, text: s.text }));
+    gap = GAP / tempo;
   } else {
     // TTS 없음: 읽기 속도 추정으로 자막 타이밍만 잡고 원본 소리로 완성
     warning = "TTS(edge-tts) 미설치: 나레이션 음성 없이 자막+원본 소리로 렌더함";
@@ -291,23 +306,25 @@ async function renderProject(id: number) {
       const units = cjk ? n.text.replace(/\s/g, "").length / 6.5 : n.text.split(/\s+/).length / 2.6;
       segs.push({ dur: Math.max(1.2, units), text: n.text });
     }
-    const est = segs.reduce((a, s) => a + s.dur + GAP, 0);
-    const scale = est > maxDur - 0.3 ? (maxDur - 0.3) / est : 1;
+    const est = segs.reduce((a, s) => a + s.dur + GAP, 0) - GAP;
+    const scale = est > limit ? limit / est : 1;
     for (const s of segs) s.dur *= scale;
+    gap = GAP * scale;
   }
 
   const cues: Cue[] = [];
   let t = 0;
   for (const s of segs) {
     cues.push({ start: t, end: t + s.dur, text: s.text });
-    t += s.dur + GAP;
+    t += s.dur + gap;
   }
-  const total = Math.max(1, Math.min(maxDur, t + 0.3));
+  t -= gap;
+  const total = Math.max(1, Math.min(maxDur, t + 0.4));
 
   // 3) 자막(ASS) + 합성
   fs.writeFileSync(
     path.join(dir, "subs.ass"),
-    buildAss({ headline1: script.headline1, headline2: script.headline2, cues, total }),
+    buildAss({ headline1: script.headline1, headline2: script.headline2, cues, total, style }),
     "utf8",
   );
   const info = await probe(p.source_path);
@@ -321,12 +338,14 @@ async function renderProject(id: number) {
     workDir: dir,
     output: tmpOut,
     total,
+    encode: style.encode,
     runOpts: { onSpawn },
   });
   ensureActive(id, "rendering");
   const finalPath = path.join(out, "final.mp4");
   fs.rmSync(path.join(out, "thumb.jpg"), { force: true });
   fs.renameSync(tmpOut, finalPath);
+  fs.copyFileSync(path.join(dir, "subs.ass"), path.join(out, "subs.ass")); // 자막 원본 보관 (캡션 내보내기/검증용)
   db.prepare("UPDATE projects SET status = 'done', output_path = ?, error = ? WHERE id = ? AND status = 'rendering'").run(
     finalPath,
     warning,

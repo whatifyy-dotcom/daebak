@@ -2,6 +2,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { assColor, getStyle, type RenderStyle, type TextStyle } from "./styles";
 
 export type RunOpts = {
   cwd?: string;
@@ -150,8 +151,15 @@ function wrap(text: string, max: number) {
   return lines.join("\\N");
 }
 
-export function buildAss(opts: { headline1: string; headline2: string; cues: Cue[]; total: number; fontName?: string }) {
+function assStyleLine(name: string, font: string, t: TextStyle, alignment: number, defMarginH: number) {
+  const m = t.marginH ?? defMarginH;
+  return `Style: ${name},${font},${t.size},${assColor(t.color)},${assColor(t.color)},${assColor(t.borderColor, t.borderOpacity ?? 1)},${assColor(t.shadowColor ?? "#000000", t.shadowOpacity ?? 0.5)},${t.bold ? 1 : 0},0,0,0,100,100,0,0,${t.border === "box" ? 3 : 1},${t.borderSize},${t.shadow},${alignment},${m},${m},${t.marginV},1`;
+}
+
+export function buildAss(opts: { headline1: string; headline2: string; cues: Cue[]; total: number; fontName?: string; style?: RenderStyle }) {
   const font = opts.fontName ?? "Malgun Gothic";
+  const st = opts.style ?? getStyle(null);
+  const bars = st.bars ?? [];
   const header = `[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -161,20 +169,29 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: H1,${font},86,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,6,2,8,60,60,150,1
-Style: H2,${font},86,&H0000E5FF,&H0000E5FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,6,2,8,60,60,260,1
-Style: Sub,${font},64,&H00FFFFFF,&H00FFFFFF,&H00000000,&H99000000,1,0,0,0,100,100,0,0,1,5,2,2,80,80,430,1
+${assStyleLine("H1", font, st.h1, 8, 60)}
+${assStyleLine("H2", font, st.h2, 8, 60)}
+${assStyleLine("Sub", font, st.sub, 2, 80)}
+Style: Bar,${font},20,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `;
   const end = assTime(opts.total);
   const lines: string[] = [];
-  if (opts.headline1) lines.push(`Dialogue: 1,${assTime(0)},${end},H1,,0,0,0,,${assEscape(opts.headline1)}`);
-  if (opts.headline2) lines.push(`Dialogue: 1,${assTime(0)},${end},H2,,0,0,0,,${assEscape(opts.headline2)}`);
+  for (const b of bars) {
+    const c = assColor(b.color, b.opacity ?? 1); // &HAABBGGRR
+    const alpha = `&H${c.slice(2, 4)}&`;
+    const bgr = `&H${c.slice(4)}&`;
+    lines.push(
+      `Dialogue: 0,${assTime(0)},${end},Bar,,0,0,0,,{\\an7\\pos(0,${b.y})\\bord0\\shad0\\1c${bgr}\\1a${alpha}\\p1}m 0 0 l 1080 0 l 1080 ${b.height} l 0 ${b.height}{\\p0}`,
+    );
+  }
+  if (opts.headline1) lines.push(`Dialogue: 2,${assTime(0)},${end},H1,,0,0,0,,${assEscape(opts.headline1)}`);
+  if (opts.headline2) lines.push(`Dialogue: 2,${assTime(0)},${end},H2,,0,0,0,,${assEscape(opts.headline2)}`);
   for (const c of opts.cues) {
     if (c.start >= opts.total) break;
-    lines.push(`Dialogue: 0,${assTime(c.start)},${assTime(Math.min(c.end, opts.total))},Sub,,0,0,0,,${wrap(assEscape(c.text), 16)}`);
+    lines.push(`Dialogue: 1,${assTime(c.start)},${assTime(Math.min(c.end, opts.total))},Sub,,0,0,0,,${wrap(assEscape(c.text), st.subWrap)}`);
   }
   return header + lines.join("\n") + "\n";
 }
@@ -190,6 +207,7 @@ export async function composeShort(opts: {
   workDir: string; // subs.ass, fonts/ 가 있는 곳
   output: string;
   total: number;
+  encode?: { preset: string; crf: number }; // 기본 veryfast/23
   runOpts?: RunOpts;
 }) {
   const v =
@@ -214,7 +232,7 @@ export async function composeShort(opts: {
     "-filter_complex", `${v};${a}`,
     "-map", "[v]", "-map", "[aout]",
     "-t", opts.total.toFixed(3),
-    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+    "-c:v", "libx264", "-preset", opts.encode?.preset ?? "veryfast", "-crf", String(opts.encode?.crf ?? 23),
     "-c:a", "aac", "-b:a", "160k", "-ar", "44100",
     "-movflags", "+faststart",
     opts.output,
