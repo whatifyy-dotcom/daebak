@@ -11,7 +11,8 @@ export const uploadDir = (id: number) => path.join(DATA_DIR, "uploads", String(i
 export const outputDir = (id: number) => path.join(DATA_DIR, "outputs", String(id));
 export const workDir = (id: number, kind: string) => path.join(DATA_DIR, "work", String(id), kind);
 
-const FONT_FILE = "C:\\Windows\\Fonts\\malgun.ttf";
+// 빌드 시 번들러가 절대경로를 추적하지 않도록 런타임에 조합한다.
+const FONT_FILE = process.env.FONT_FILE ?? path.join(process.env.WINDIR ?? "C:\\Windows", "Fonts", "malgun.ttf");
 
 export type Narration = { text: string };
 export type Script = { headline1: string; headline2: string; ytTitle: string; narration: Narration[] };
